@@ -133,7 +133,7 @@ class SpectrogramParser(AudioParser):
 
 
 class SpectrogramDataset(Dataset, SpectrogramParser):
-    def __init__(self, audio_conf, manifest_filepath, labels, normalize=False, augment=False, transcript=False):
+    def __init__(self, audio_conf, manifest_filepath, labels, normalize=False, augment=False):
         """
         Dataset that loads tensors via a csv containing file paths to audio files and transcripts separated by
         a comma. Each new line is a different sample. Example below:
@@ -149,11 +149,8 @@ class SpectrogramDataset(Dataset, SpectrogramParser):
         """
         self.lock = Lock()
         self.init = False
-        self.transcript = transcript
         self.labels = labels
         self.manifest_filepath = manifest_filepath
-        with open(manifest_filepath, 'r') as f:
-            self.size = len(f.readlines()) - 1
         super(SpectrogramDataset, self).__init__(audio_conf, normalize, augment)
 
     def __getitem__(self, index):
@@ -167,25 +164,21 @@ class SpectrogramDataset(Dataset, SpectrogramParser):
             self.lock.release()
             self.init = True
         
+        print('in')
         audio, transcript = self.fetcher.get_item()
+        print('out')
         spect = self.parse_audio(audio)
-        if self.transcript:
-            result = self.parse_transcript(transcript[1])
-        else:
-            result = self.parse_vectors(transcript[2:])
-        return spect, result
+        transcript = self.parse_transcript(transcript[1])
+        print('done')
+        return spect, transcript
 
-    def parse_vectors(self, items):
-        items = list(map(eval, items))
-        return sum(items, [])
-    
     def parse_transcript(self, transcript):
         transcript = self.regex.sub('', transcript).upper()
         transcript = list(filter(None, [self.labels_map.get(x) for x in list(transcript)]))
         return transcript
 
     def __len__(self):
-        return self.size
+        return len(self.labels)
 
 
 def _collate_fn(batch):

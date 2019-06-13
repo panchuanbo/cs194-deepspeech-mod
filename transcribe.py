@@ -15,44 +15,60 @@ from model import DeepSpeech
 import os.path
 import json
 
+import numpy as np
+import scipy.io
 
-def decode_results(model, decoded_output, decoded_offsets):
-    results = {
-        "output": [],
-        "_meta": {
-            "acoustic_model": {
-                "name": os.path.basename(args.model_path)
-            },
-            "language_model": {
-                "name": os.path.basename(args.lm_path) if args.lm_path else None,
-            },
-            "decoder": {
-                "lm": args.lm_path is not None,
-                "alpha": args.alpha if args.lm_path is not None else None,
-                "beta": args.beta if args.lm_path is not None else None,
-                "type": args.decoder,
-            }
-        }
+unique_ages = ['fourties', 'twenties', 'seventies', 'teens', 'sixties', 'thirties', 'eighties', 'fifties']
+unique_genders = ['male', 'female']
+unique_accents = ['african', 'newzealand', 'malaysia', 'us', 'england', 'indian', 'wales', 'philippines', 'southatlandtic', 'bermuda', 'scotland', 'australia', 'canada', 'singapore', 'ireland', 'hongkong']
+unique_cols = ["#191970", "#87CEEB",
+               "#FF8C00", "#808080",
+               "#98FB98", "#FF00FF",
+               "#8C1515", "#FFA07A",
+               "#000080", "#F0FFFF",
+               "#D3D3D3", "#228B22",
+               "#F88072", "#FFA500",
+               "#808000", "#5F93A0"]
+
+def out_to_preds(out):
+    out = out.detach().numpy()
+    out = out.reshape(len(unique_ages) + len(unique_genders) + len(unique_accents))
+
+    print(out)
+    out[:8] /= np.sum(out[:8])
+    out[8:10] /= np.sum(out[8:10])
+    out[10:] /= np.sum(out[10:])
+    out *= 100
+
+    print(out)
+
+    # ages = {k: float(out[i]) for (i, k) in enumerate(unique_ages)}
+    # genders = {k: float(out[8+i]) for (i, k) in enumerate(unique_genders)}
+    # accents = {k: float(out[10+i]) for (i, k) in enumerate(unique_accents)}
+
+    ages = [{"title": k, "value": round(float(out[i]), 2), "color": unique_cols[i]} for (i, k) in enumerate(unique_ages)]
+    print(ages)
+    genders = [{"title": k, "value": round(float(out[8+i]), 2), "color": unique_cols[i]} for (i, k) in enumerate(unique_genders)]
+    print(genders)
+    accents = [{"title": k, "value": round(float(out[10+i]), 2), "color": unique_cols[i]} for (i, k) in enumerate(unique_accents)]
+
+    return {
+        "ages": ages,
+        "genders": genders,
+        "accents": accents
     }
 
-    for b in range(len(decoded_output)):
-        for pi in range(min(args.top_paths, len(decoded_output[b]))):
-            result = {'transcription': decoded_output[b][pi]}
-            if args.offsets:
-                result['offsets'] = decoded_offsets[b][pi].tolist()
-            results['output'].append(result)
-    return results
-
-
 def transcribe(audio_path, parser, model, decoder, device):
-    spect = parser.parse_audio(audio_path).contiguous()
+    print(audio_path)
+    wav_data = np.array(scipy.io.wavfile.read(audio_path))[1]
+
+    spect = parser.parse_audio(wav_data)
     spect = spect.view(1, 1, spect.size(0), spect.size(1))
     spect = spect.to(device)
-    input_sizes = torch.IntTensor([spect.size(3)]).int()
+    input_sizes = torch.IntTensor([1]).int()
     out, output_sizes = model(spect, input_sizes)
-    decoded_output, decoded_offsets = decoder.decode(out, output_sizes)
-    return decoded_output, decoded_offsets
 
+    return out_to_preds(out)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='DeepSpeech transcription')

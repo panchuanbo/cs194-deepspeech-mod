@@ -10,12 +10,12 @@ import torch.utils.data.distributed
 from apex.fp16_utils import FP16_Optimizer
 from apex.parallel import DistributedDataParallel
 from tqdm import tqdm
-from warpctc_pytorch import CTCLoss
+from torch.nn import CrossEntropyLoss
 
 from data.data_loader import AudioDataLoader, SpectrogramDataset, BucketingSampler, DistributedBucketingSampler
 from decoder import GreedyDecoder
 from logger import VisdomLogger, TensorBoardLogger
-from model import DeepSpeech, supported_rnns
+from model_custom_dataset import DeepSpeech, supported_rnns
 from utils import convert_model_to_half, reduce_tensor, check_loss
 
 parser = argparse.ArgumentParser(description='DeepSpeech training')
@@ -86,6 +86,8 @@ parser.add_argument('--static-loss-scale', type=float, default=1,
 parser.add_argument('--dynamic-loss-scale', action='store_true',
                     help='Use dynamic loss scaling for mixed precision. If supplied, this argument supersedes ' +
                          '--static_loss_scale. Suggested to turn on for mixed precision')
+parser.add_argument('--custom-model', default=False, help='enable custom model')
+
 torch.manual_seed(123456)
 torch.cuda.manual_seed_all(123456)
 
@@ -137,9 +139,9 @@ if __name__ == '__main__':
     save_folder = args.save_folder
     os.makedirs(save_folder, exist_ok=True)  # Ensure save folder exists
 
-    loss_results, cer_results, wer_results = torch.Tensor(args.epochs), torch.Tensor(args.epochs), torch.Tensor(
-        args.epochs)
-    best_wer = None
+    loss_results, age_results, gender_results, accent_results = torch.Tensor(args.epochs), torch.Tensor(args.epochs), torch.Tensor(
+        args.epochs), torch.Tensor(args.epochs)
+    best_avg_acc = None
     if main_proc and args.visdom:
         visdom_logger = VisdomLogger(args.id, args.epochs)
     if main_proc and args.tensorboard:
@@ -162,8 +164,19 @@ if __name__ == '__main__':
             else:
                 start_iter += 1
             avg_loss = int(package.get('avg_loss', 0))
-            loss_results, cer_results, wer_results = package['loss_results'], package['cer_results'], \
-                                                     package['wer_results']
+            def update_tensor(t):
+                if t.shape[0] <= args.epochs:
+                    print("updated tensor from size %d to %d" % (t.shape[0], args.epochs))
+                    new_tensor = torch.Tensor(args.epochs)
+                    for i in range(t.shape[0]):
+                        new_tensor[i] = t[i]
+                    return new_tensor
+                return t
+            loss_results   = update_tensor(package['loss_results'])
+            age_results    = update_tensor(package['age_results'])
+            gender_results = update_tensor(package['gender_results'])
+            accent_results = update_tensor(package['accent_results'])
+            
             if main_proc and args.visdom:  # Add previous scores to visdom graph
                 visdom_logger.load_previous_values(start_epoch, package)
             if main_proc and args.tensorboard:  # Previous scores to tensorboard logs
@@ -226,7 +239,7 @@ if __name__ == '__main__':
     print(model)
     print("Number of parameters: %d" % DeepSpeech.get_param_size(model))
 
-    criterion = CTCLoss()
+    celoss = CrossEntropyLoss()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -235,20 +248,28 @@ if __name__ == '__main__':
         model.train()
         end = time.time()
         start_epoch_time = time.time()
-        for i, (data) in enumerate(train_loader, start=start_iter):
+#         print(list(enumerate(train_loader, start=start_iter)))
+        for i, (data) in tqdm(enumerate(train_loader, start=start_iter), total=len(train_loader)):
+            #enumerate(train_loader, start=start_iter):
             if i == len(train_sampler):
                 break
             inputs, targets, input_percentages, target_sizes = data
+            targets = targets.view(-1, 26).long().to(device)
             input_sizes = input_percentages.mul_(int(inputs.size(3))).int()
+            print(inputs.shape)
+            print(input_sizes.shape)
             # measure data loading time
             data_time.update(time.time() - end)
             inputs = inputs.to(device)
-
-            out, output_sizes = model(inputs, input_sizes)
-            out = out.transpose(0, 1)  # TxNxH
-
+   
+            out = model(inputs, input_sizes)
+#             out = out.transpose(0, 1)  # TxNxH
+            
             float_out = out.float()  # ensure float32 for loss
-            loss = criterion(float_out, targets, output_sizes, target_sizes).to(device)
+            #first category
+            loss = celoss(float_out[:, :8], targets[:, :8].max(1)[1]).to(device)
+            loss += celoss(float_out[:, 8:10], targets[:, 8:10].max(1)[1]).to(device)
+            loss += celoss(float_out[:, 10:], targets[:, 10:].max(1)[1]).to(device)
             loss = loss / inputs.size(0)  # average the loss by minibatch
 
             if args.distributed:
@@ -291,10 +312,10 @@ if __name__ == '__main__':
                 print("Saving checkpoint model to %s" % file_path)
                 torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, iteration=i,
                                                 loss_results=loss_results,
-                                                wer_results=wer_results, cer_results=cer_results, avg_loss=avg_loss),
+                                                age_results=age_results, gender_results=gender_results, 
+                                                accent_results=accent_results, avg_loss=avg_loss),
                            file_path)
-            del loss, out, float_out
-
+            del loss, out, float_out, inputs, targets
         avg_loss /= len(train_sampler)
 
         epoch_time = time.time() - start_epoch_time
@@ -303,7 +324,7 @@ if __name__ == '__main__':
               'Average Loss {loss:.3f}\t'.format(epoch + 1, epoch_time=epoch_time, loss=avg_loss))
 
         start_iter = 0  # Reset start iteration for next epoch
-        total_cer, total_wer = 0, 0
+        total_val, ages_correct, genders_correct, accents_correct = 0., 0., 0., 0.
         model.eval()
         with torch.no_grad():
             for i, (data) in tqdm(enumerate(test_loader), total=len(test_loader)):
@@ -318,49 +339,66 @@ if __name__ == '__main__':
                     split_targets.append(targets[offset:offset + size])
                     offset += size
 
-                out, output_sizes = model(inputs, input_sizes)
-
-                decoded_output, _ = decoder.decode(out, output_sizes)
-                target_strings = decoder.convert_to_strings(split_targets)
-                wer, cer = 0, 0
-                for x in range(len(target_strings)):
-                    transcript, reference = decoded_output[x][0], target_strings[x][0]
-                    wer += decoder.wer(transcript, reference) / float(len(reference.split()))
-                    cer += decoder.cer(transcript, reference) / float(len(reference))
-                total_cer += cer
-                total_wer += wer
-                del out
-            wer = total_wer / len(test_loader.dataset)
-            cer = total_cer / len(test_loader.dataset)
-            wer *= 100
-            cer *= 100
+                out = model(inputs, input_sizes)
+                
+                # Assume target sizes are all equal
+                target_size = target_sizes[0]
+                targets = targets.reshape((-1, target_size)).to(device)
+                
+                # print(torch.cat((torch.arange(10).to(device), out[:,:8].argmax(1))))
+                results = torch.zeros(targets.shape)
+                
+                # results[torch.arange(10), out[:,:8].argmax(1)] = 1
+                # results[torch.arange(10), out[:,8:10].argmax(1) + 8] = 1
+                # results[torch.arange(10), out[:,10:].argmax(1) + 10] = 1
+                
+                ages_correct    += torch.sum(out[:,:8].argmax(1) == targets[:,:8].argmax(1))
+                genders_correct += torch.sum(out[:,8:10].argmax(1) == targets[:,8:10].argmax(1))
+                accents_correct += torch.sum(out[:,10:].argmax(1) == targets[:,10:].argmax(1))
+                total_val += targets.shape[0]
+                
+                del out, inputs, targets
+            
+            ages_correct = ages_correct.type(torch.FloatTensor)
+            genders_correct = genders_correct.type(torch.FloatTensor)
+            accents_correct = accents_correct.type(torch.FloatTensor)
+            
             loss_results[epoch] = avg_loss
-            wer_results[epoch] = wer
-            cer_results[epoch] = cer
+            age_results[epoch] = ages_correct / total_val
+            gender_results[epoch] = genders_correct / total_val
+            accent_results[epoch] = accents_correct / total_val
+            
+            avg_acc = (age_results[epoch] + gender_results[epoch] + accent_results[epoch])/3
             print('Validation Summary Epoch: [{0}]\t'
-                  'Average WER {wer:.3f}\t'
-                  'Average CER {cer:.3f}\t'.format(
-                epoch + 1, wer=wer, cer=cer))
+                  'Age {age:.3f}\t'
+                  'Gender {gender:.3f}\t'
+                  'Accent {accent:.3f}\t'
+                  'Average {average:.3f}\t'
+                  'Loss {loss:.3f}\t'.format(
+                epoch + 1, age=ages_correct/total_val, gender=genders_correct/total_val, 
+                      accent=accents_correct/total_val, average=avg_acc, loss=avg_loss))
 
         values = {
             'loss_results': loss_results,
-            'cer_results': cer_results,
-            'wer_results': wer_results
+            'age_results': age_results,
+            'gender_results': gender_results,
+            'accent_results': accent_results,
         }
         if args.visdom and main_proc:
             visdom_logger.update(epoch, values)
         if args.tensorboard and main_proc:
             tensorboard_logger.update(epoch, values, model.named_parameters())
             values = {
-                'Avg Train Loss': avg_loss,
-                'Avg WER': wer,
-                'Avg CER': cer
+                'loss_results': loss_results,
+                'age_results': age_results,
+                'gender_results': gender_results,
+                'accent_results': accent_results,
             }
 
         if main_proc and args.checkpoint:
             file_path = '%s/deepspeech_%d.pth.tar' % (save_folder, epoch + 1)
             torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, loss_results=loss_results,
-                                            wer_results=wer_results, cer_results=cer_results),
+                                            age_results=age_results, gender_results=gender_results, accent_results=accent_results),
                        file_path)
         # anneal lr
         param_groups = optimizer.optimizer.param_groups if args.mixed_precision else optimizer.param_groups
@@ -368,12 +406,12 @@ if __name__ == '__main__':
             g['lr'] = g['lr'] / args.learning_anneal
         print('Learning rate annealed to: {lr:.6f}'.format(lr=g['lr']))
 
-        if main_proc and (best_wer is None or best_wer > wer):
+        if main_proc and (best_avg_acc is None or best_avg_acc < avg_acc):
             print("Found better validated model, saving to %s" % args.model_path)
             torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, loss_results=loss_results,
-                                            wer_results=wer_results, cer_results=cer_results)
+                                            age_results=age_results, gender_results=gender_results, accent_results=accent_results)
                        , args.model_path)
-            best_wer = wer
+            best_avg_acc = avg_acc
 
             avg_loss = 0
             if not args.no_shuffle:
